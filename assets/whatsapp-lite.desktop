@@ -1,0 +1,13 @@
+[Desktop Entry]
+Name=WhatsApp
+GenericName=Chat & Messaging
+Comment=Lightweight WhatsApp Web Desktop Client
+Exec=whatsapp-lite
+Icon=whatsapp
+Terminal=false
+Type=Application
+Categories=Network;InstantMessaging;Chat;
+StartupNotify=true
+StartupWMClass=whatsapp-lite
+X-Hyprland-Class=whatsapp-lite
+MimeType=x-scheme-handler/whatsapp;
