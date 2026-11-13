@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """
-WhatsApp Lite - A lightweight, memory-efficient WhatsApp Desktop client for Linux.
-Built on PyQt6 and QtWebEngine.
+WhatsApp Lite - A high-performance, lightweight WhatsApp Desktop client for Linux.
+Built with PyQt6 and QtWebEngine.
 
-Features:
-- ~200MB RAM usage (compared to 800MB-1.2GB for Electron wrappers)
-- Audio & Video Calling support (WebRTC permissions auto-granted)
-- Native System Tray with unread message badges (e.g. for Waybar / Hyprland)
-- Minimize-to-tray on close
-- Desktop notifications & incoming call alerts
-- Single-instance enforcement (re-running focuses the active window)
-- High-DPI & Wayland native (Hyprland friendly app_id)
+Optimizations:
+- ~180MB - 250MB RAM usage (compared to 800MB-1.2GB for Electron)
+- Hardware-accelerated video decoding (VA-API on Intel/AMD GPUs)
+- PipeWire screen sharing on Wayland (Hyprland / Sway)
+- WebRTC Audio & Video Calling with auto-granted media permissions
+- Incoming call auto-raise & critical priority desktop alerts
+- Native System Tray with real-time unread badge counter
+- Automatic attachment download handler with completion notifications
+- External links open in default web browser
+- Zero white-flash dark theme background on startup
+- Slim emerald progress bar during page load
+- V8 memory garbage collector triggered on hide/minimize
+- Single-instance enforcement (re-running focuses existing window)
 """
 
 import sys
@@ -18,6 +23,23 @@ import os
 import re
 import shutil
 import subprocess
+
+# ---------------------------------------------------------
+# Chromium & Qt Optimization Flags
+# (Must be configured before QApplication initializes)
+# ---------------------------------------------------------
+os.environ.setdefault("QT_QPA_PLATFORM", "wayland;xcb")
+
+existing_flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+optimizations = (
+    "--enable-features=VaapiVideoDecoder,VaapiIgnoreDriverChecks,WebRTCPipeWireCapturer "
+    "--enable-gpu-rasterization "
+    "--enable-zero-copy "
+    "--ignore-gpu-blocklist "
+    "--disable-features=Translate,AutofillServerCommunication,OptimizationHints "
+    "--js-flags=--expose-gc "
+)
+os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = f"{existing_flags} {optimizations}".strip()
 
 # ---------------------------------------------------------
 # Dependency Check
@@ -29,15 +51,16 @@ try:
     )
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QSystemTrayIcon,
-        QMenu, QMessageBox
+        QMenu, QMessageBox, QProgressBar, QVBoxLayout, QWidget
     )
     from PyQt6.QtGui import (
         QIcon, QPixmap, QPainter, QColor, QFont,
-        QAction, QKeySequence, QShortcut
+        QAction, QKeySequence, QShortcut, QDesktopServices
     )
     from PyQt6.QtNetwork import QLocalServer, QLocalSocket
     from PyQt6.QtWebEngineCore import (
-        QWebEngineProfile, QWebEnginePage, QWebEngineSettings
+        QWebEngineProfile, QWebEnginePage, QWebEngineSettings,
+        QWebEngineDownloadRequest
     )
     from PyQt6.QtWebEngineWidgets import QWebEngineView
 except ImportError as e:
@@ -50,7 +73,6 @@ except ImportError as e:
     print("  sudo pacman -S python-pyqt6 python-pyqt6-webengine\n")
     print("=" * 60 + "\n")
     
-    # Try displaying a graphical message if notify-send is available
     if shutil.which("notify-send"):
         subprocess.run([
             "notify-send",
@@ -81,7 +103,6 @@ WHATSAPP_URL = "https://web.whatsapp.com"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_ICON = os.path.join(SCRIPT_DIR, "..", "assets", "icon.svg")
 
-# Icon search candidates
 ICON_CANDIDATES = [
     ASSETS_ICON,
     os.path.expanduser("~/.local/share/icons/hicolor/scalable/apps/whatsapp.svg"),
@@ -96,7 +117,7 @@ def get_base_icon() -> QIcon:
     for path in ICON_CANDIDATES:
         if os.path.exists(path):
             return QIcon(path)
-    # Built-in SVG fallback if no system icon is found
+    # Built-in SVG fallback
     svg_data = b"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
       <circle cx="24" cy="24" r="22" fill="#25D366"/>
       <path fill="#FFFFFF" d="M34.5 28.5c-.5-.2-2.9-1.4-3.3-1.6-.4-.2-.8-.2-1.1.2-.3.5-1.2 1.6-1.5 1.9-.3.3-.6.4-1.1.2-.5-.2-2.2-.8-4.2-2.6-1.5-1.4-2.6-3.1-2.9-3.6-.3-.5 0-.8.2-1 .2-.2.5-.5.7-.8.2-.3.3-.5.4-.8.2-.3.1-.7 0-.9-.2-.2-1.1-2.7-1.5-3.6-.4-.9-.8-.8-1.1-.8h-.9c-.3 0-.9.1-1.4.6-.5.5-1.9 1.9-1.9 4.6 0 2.7 2 5.3 2.3 5.6.3.4 3.9 6 9.4 8.4 1.3.6 2.3.9 3.1 1.2 1.3.4 2.5.4 3.4.2 1.1-.2 3.3-1.3 3.8-2.6.5-1.3.5-2.4.3-2.6-.1-.3-.4-.4-.9-.7z"/>
@@ -106,19 +127,25 @@ def get_base_icon() -> QIcon:
     return QIcon(pix)
 
 # ---------------------------------------------------------
-# Custom WebEnginePage for Permissions & WebRTC Calls
+# Custom WebEnginePage for External Links & Calling
 # ---------------------------------------------------------
+class ExternalLinkPage(QWebEnginePage):
+    """Temporary page to redirect target='_blank' links to system browser"""
+    def acceptNavigationRequest(self, url: QUrl, nav_type, is_main_frame):
+        QDesktopServices.openUrl(url)
+        self.deleteLater()
+        return False
+
 class WhatsAppWebPage(QWebEnginePage):
     def __init__(self, profile, parent=None):
         super().__init__(profile, parent)
         self.featurePermissionRequested.connect(self.on_feature_permission_requested)
+        self.setBackgroundColor(QColor("#111b21"))
 
     def on_feature_permission_requested(self, security_origin: QUrl, feature):
         host = security_origin.host()
-        # Automatically allow media devices and notifications for WhatsApp
         if "whatsapp.com" in host or "whatsapp.net" in host:
             try:
-                # Qt6 PermissionPolicy
                 policy = getattr(QWebEnginePage.PermissionPolicy, 'PermissionGrantedByUser', None)
                 if policy is None:
                     policy = getattr(QWebEnginePage, 'PermissionGrantedByUser', 1)
@@ -134,10 +161,28 @@ class WhatsAppWebPage(QWebEnginePage):
             except Exception:
                 pass
 
+    def acceptNavigationRequest(self, url: QUrl, nav_type, is_main_frame):
+        host = url.host().lower()
+        if (
+            not host
+            or "whatsapp.com" in host
+            or "whatsapp.net" in host
+            or url.scheme() in ("blob", "data", "about")
+        ):
+            return True
+
+        # Open external links in default browser
+        if nav_type == QWebEnginePage.NavigationType.NavigationTypeLinkClicked:
+            QDesktopServices.openUrl(url)
+            return False
+
+        return True
+
+    def createWindow(self, window_type):
+        return ExternalLinkPage(self.profile(), self)
+
     def javaScriptConsoleMessage(self, level, message, line_number, source_id):
-        # Silence benign console warnings for cleaner terminal output
-        if "warning" in message.lower() or "error" in message.lower():
-            pass
+        pass
 
 # ---------------------------------------------------------
 # Main Application Window
@@ -155,6 +200,9 @@ class WhatsAppWindow(QMainWindow):
         self.resize(1120, 780)
         self.setMinimumSize(600, 500)
 
+        # Eliminate white flash during window creation
+        self.setStyleSheet("QMainWindow { background-color: #111b21; }")
+
         # Setup persistent web profile
         self.profile = QWebEngineProfile("whatsapp_storage", self)
         os.makedirs(USER_DATA_DIR, exist_ok=True)
@@ -166,7 +214,11 @@ class WhatsAppWindow(QMainWindow):
         )
         self.profile.setHttpUserAgent(USER_AGENT)
 
-        # Setup WebEngine Settings
+        # Limit cache growth (120MB max disk cache)
+        if hasattr(self.profile, 'setHttpCacheMaximumSize'):
+            self.profile.setHttpCacheMaximumSize(120 * 1024 * 1024)
+
+        # WebEngine settings
         settings = self.profile.settings()
         settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, True)
@@ -175,34 +227,99 @@ class WhatsAppWindow(QMainWindow):
         settings.setAttribute(QWebEngineSettings.WebAttribute.ScrollAnimatorEnabled, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.DnsPrefetchEnabled, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.FullScreenSupportEnabled, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanAccessClipboard, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanPaste, True)
 
-        # Desktop notification presenter handler
+        # Connect download handler
+        self.profile.downloadRequested.connect(self.on_download_requested)
+
+        # Desktop notification presenter
         if hasattr(self.profile, 'setNotificationPresenter'):
             self.profile.setNotificationPresenter(self.handle_web_notification)
 
+        # Container & Layout with Slim Emerald Progress Bar
+        container = QWidget(self)
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setFixedHeight(2)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: none;
+                background-color: #111b21;
+            }
+            QProgressBar::chunk {
+                background-color: #00a884;
+            }
+        """)
+        layout.addWidget(self.progress_bar)
+
         # Web view setup
         self.web_page = WhatsAppWebPage(self.profile, self)
+        self.web_page.fullScreenRequested.connect(self.on_fullscreen_requested)
+
         self.web_view = QWebEngineView(self)
         self.web_view.setPage(self.web_page)
-        self.setCentralWidget(self.web_view)
+        self.web_view.setStyleSheet("background-color: #111b21;")
+        layout.addWidget(self.web_view)
 
-        # Connect signals
+        self.setCentralWidget(container)
+
+        # Connect loading & title signals
+        self.web_view.loadStarted.connect(self.on_load_started)
+        self.web_view.loadProgress.connect(self.on_load_progress)
+        self.web_view.loadFinished.connect(self.on_load_finished)
         self.web_view.titleChanged.connect(self.on_title_changed)
 
-        # Setup System Tray Icon
+        # Setup System Tray Icon & Shortcuts
         self.setup_tray_icon()
-
-        # Keyboard shortcuts
         self.setup_shortcuts()
 
-        # Load WhatsApp
+        # Load WhatsApp Web
         self.web_view.load(QUrl(WHATSAPP_URL))
+
+    def on_load_started(self):
+        self.progress_bar.show()
+        self.progress_bar.setValue(10)
+
+    def on_load_progress(self, progress):
+        self.progress_bar.setValue(progress)
+
+    def on_load_finished(self, success):
+        self.progress_bar.hide()
+
+    def on_fullscreen_requested(self, request):
+        if request.toggleOn():
+            self.showFullScreen()
+            request.accept()
+        else:
+            self.showNormal()
+            request.accept()
+
+    def on_download_requested(self, download: QWebEngineDownloadRequest):
+        download_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
+        filename = download.suggestedFileName() or download.downloadFileName() or "whatsapp-attachment"
+        download.setDownloadDirectory(download_dir)
+        download.setDownloadFileName(filename)
+        download.accept()
+
+        def on_finished():
+            if download.state() == QWebEngineDownloadRequest.DownloadState.DownloadCompleted:
+                self.send_system_notification(
+                    "WhatsApp Download Finished",
+                    f"Saved {filename} to Downloads",
+                    urgency="normal"
+                )
+        download.isFinishedChanged.connect(on_finished)
 
     def setup_tray_icon(self):
         self.tray_icon = QSystemTrayIcon(self.base_icon, self)
         self.tray_icon.setToolTip("WhatsApp Lite")
 
-        # Tray Context Menu
         self.tray_menu = QMenu()
         
         show_action = QAction("Show / Hide", self)
@@ -229,14 +346,10 @@ class WhatsAppWindow(QMainWindow):
         self.tray_icon.show()
 
     def setup_shortcuts(self):
-        # Ctrl+Q -> Quit
         QShortcut(QKeySequence("Ctrl+Q"), self, self.really_quit)
-        # Ctrl+W / Esc -> Hide to tray
-        QShortcut(QKeySequence("Ctrl+W"), self, self.hide)
-        # Ctrl+R / F5 -> Reload
+        QShortcut(QKeySequence("Ctrl+W"), self, self.hide_to_tray)
         QShortcut(QKeySequence("Ctrl+R"), self, self.reload_page)
         QShortcut(QKeySequence("F5"), self, self.reload_page)
-        # Zoom controls
         QShortcut(QKeySequence("Ctrl+="), self, self.zoom_in)
         QShortcut(QKeySequence("Ctrl++"), self, self.zoom_in)
         QShortcut(QKeySequence("Ctrl+-"), self, self.zoom_out)
@@ -259,28 +372,66 @@ class WhatsAppWindow(QMainWindow):
     def toggle_mute(self, muted: bool):
         self.web_page.setAudioMuted(muted)
 
+    def show_and_activate(self):
+        self.show()
+        self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized | Qt.WindowState.WindowActive)
+        self.raise_()
+        self.activateWindow()
+
+    def hide_to_tray(self):
+        self.hide()
+        # Memory optimization: trigger V8 GC when hidden to reclaim RAM
+        if hasattr(self, 'web_page') and self.web_page:
+            self.web_page.runJavaScript("if (window.gc) { window.gc(); }")
+
     def toggle_visibility(self):
         if self.isVisible() and not self.isMinimized():
-            self.hide()
+            self.hide_to_tray()
         else:
-            self.show()
-            self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized | Qt.WindowState.WindowActive)
-            self.raise_()
-            self.activateWindow()
+            self.show_and_activate()
 
     def on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
             self.toggle_visibility()
 
     def handle_web_notification(self, notification):
-        try:
-            # Let Qt display it or forward to desktop
-            notification.show()
-        except Exception:
-            pass
+        title = (notification.title() or "").strip()
+        msg = (notification.message() or "").strip()
+
+        # Check for incoming calls
+        is_call = "call" in title.lower() or "call" in msg.lower()
+        if is_call:
+            self.show_and_activate()
+            self.send_system_notification(
+                f"📞 {title or 'WhatsApp Call'}",
+                msg or "Incoming call...",
+                urgency="critical"
+            )
+        else:
+            if not self.isActiveWindow() or not self.isVisible():
+                self.send_system_notification(title, msg, urgency="normal")
+
+    def send_system_notification(self, title, message, urgency="normal"):
+        if not title and not message:
+            return
+        if shutil.which("notify-send"):
+            try:
+                subprocess.Popen([
+                    "notify-send",
+                    "-a", "WhatsApp",
+                    "-u", urgency,
+                    "-i", "whatsapp",
+                    title,
+                    message
+                ])
+                return
+            except Exception:
+                pass
+
+        if hasattr(self, 'tray_icon') and self.tray_icon.isVisible():
+            self.tray_icon.showMessage(title, message, QSystemTrayIcon.MessageIcon.Information, 4000)
 
     def on_title_changed(self, title: str):
-        """Extract unread count from WhatsApp title e.g. '(3) WhatsApp'"""
         match = re.search(r'\((\d+)\)', title)
         if match:
             count = int(match.group(1))
@@ -301,13 +452,11 @@ class WhatsAppWindow(QMainWindow):
             self.tray_icon.setToolTip("WhatsApp Lite")
             return
 
-        # Paint badge counter on the icon
         size = 64
         pixmap = self.base_icon.pixmap(size, size)
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        # Draw red badge circle
         badge_radius = 16
         center_x = size - badge_radius - 2
         center_y = size - badge_radius - 2
@@ -315,7 +464,6 @@ class WhatsAppWindow(QMainWindow):
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawEllipse(QPoint(center_x, center_y), badge_radius, badge_radius)
 
-        # Draw number text
         painter.setPen(QColor(255, 255, 255))
         font = QFont("Sans", 14, QFont.Weight.Bold)
         painter.setFont(font)
@@ -333,42 +481,39 @@ class WhatsAppWindow(QMainWindow):
         self.tray_icon.setToolTip(f"WhatsApp Lite - {unread} unread messages")
 
     def closeEvent(self, event):
-        """Minimize to tray on window close button"""
         if self.is_quitting:
             event.accept()
         else:
             event.ignore()
-            self.hide()
+            self.hide_to_tray()
 
     def really_quit(self):
         self.is_quitting = True
+        if hasattr(self, 'web_view') and self.web_view:
+            self.web_view.stop()
+            self.web_view.setPage(None)
+        if hasattr(self, 'web_page') and self.web_page:
+            self.web_page.deleteLater()
         self.app.quit()
 
 # ---------------------------------------------------------
 # Single Instance Management & Entry Point
 # ---------------------------------------------------------
 def main():
-    # Set Wayland Desktop file name for Hyprland/Wayland window matching
-    os.environ.setdefault("QT_QPA_PLATFORM", "wayland;xcb")
-    
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setDesktopFileName(APP_NAME)
     app.setApplicationDisplayName(APP_DISPLAY_NAME)
 
-    # Check if another instance is already running
     socket = QLocalSocket()
     socket.connectToServer(SINGLE_INSTANCE_KEY)
     if socket.waitForConnected(400):
-        # Primary instance exists, signal it to show up
         socket.write(b"SHOW\n")
         socket.waitForBytesWritten(1000)
         socket.disconnectFromServer()
         sys.exit(0)
 
-    # Primary instance: start local server
     server = QLocalServer()
-    # Remove stale socket file if any
     QLocalServer.removeServer(SINGLE_INSTANCE_KEY)
     server.listen(SINGLE_INSTANCE_KEY)
 
@@ -382,14 +527,9 @@ def main():
     def on_client_read(client):
         data = client.readAll().data().decode("utf-8")
         if "SHOW" in data:
-            window.show()
-            window.setWindowState(window.windowState() & ~Qt.WindowState.WindowMinimized | Qt.WindowState.WindowActive)
-            window.raise_()
-            window.activateWindow()
+            window.show_and_activate()
 
     server.newConnection.connect(handle_incoming_connection)
-
-    # Show initial window
     window.show()
     sys.exit(app.exec())
 
