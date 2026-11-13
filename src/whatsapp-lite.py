@@ -23,6 +23,7 @@ import os
 import re
 import shutil
 import subprocess
+import urllib.parse
 
 # ---------------------------------------------------------
 # Chromium & Qt Optimization Flags
@@ -60,7 +61,7 @@ try:
     from PyQt6.QtNetwork import QLocalServer, QLocalSocket
     from PyQt6.QtWebEngineCore import (
         QWebEngineProfile, QWebEnginePage, QWebEngineSettings,
-        QWebEngineDownloadRequest
+        QWebEngineDownloadRequest, QWebEngineScript
     )
     from PyQt6.QtWebEngineWidgets import QWebEngineView
 except ImportError as e:
@@ -134,14 +135,83 @@ def get_base_icon() -> QIcon:
     return QIcon(pix)
 
 # ---------------------------------------------------------
+# External URL Dispatcher (Wayland & Linux Native)
+# ---------------------------------------------------------
+def clean_external_url(url_str: str) -> str:
+    """Unwrap Meta / WhatsApp redirect tracker parameters if present"""
+    if not url_str:
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(url_str)
+        if any(d in parsed.netloc for d in ("wl.co", "facebook.com", "whatsapp.com")):
+            qs = urllib.parse.parse_qs(parsed.query)
+            if "u" in qs and qs["u"]:
+                return urllib.parse.unquote(qs["u"][0])
+    except Exception:
+        pass
+    return url_str
+
+def open_external_url(target):
+    """Reliably launch external URL in user's default browser (e.g. Chrome / Brave)"""
+    if isinstance(target, QUrl):
+        url_str = target.toString()
+    else:
+        url_str = str(target)
+
+    url_str = clean_external_url(url_str).strip()
+    if not url_str or url_str in ("about:blank", "about:", ""):
+        return
+
+    # 1. Primary: xdg-open in detached session
+    try:
+        subprocess.Popen(
+            ["xdg-open", url_str],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+        return
+    except Exception:
+        pass
+
+    # 2. Secondary: gio open
+    if shutil.which("gio"):
+        try:
+            subprocess.Popen(
+                ["gio", "open", url_str],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True
+            )
+            return
+        except Exception:
+            pass
+
+    # 3. Fallback: QDesktopServices
+    QDesktopServices.openUrl(QUrl(url_str))
+
+# ---------------------------------------------------------
 # Custom WebEnginePage for External Links & Calling
 # ---------------------------------------------------------
 class ExternalLinkPage(QWebEnginePage):
-    """Temporary page to redirect target='_blank' links to system browser"""
+    """Temporary page to intercept window.open and target='_blank' links"""
+    def __init__(self, profile, parent=None):
+        super().__init__(profile, parent)
+        self.urlChanged.connect(self.on_url_changed)
+
     def acceptNavigationRequest(self, url: QUrl, nav_type, is_main_frame):
-        QDesktopServices.openUrl(url)
-        self.deleteLater()
-        return False
+        url_str = url.toString()
+        if url_str and url_str != "about:blank":
+            open_external_url(url_str)
+            self.deleteLater()
+            return False
+        return True
+
+    def on_url_changed(self, url: QUrl):
+        url_str = url.toString()
+        if url_str and url_str != "about:blank":
+            open_external_url(url_str)
+            self.deleteLater()
 
 class WhatsAppWebPage(QWebEnginePage):
     def __init__(self, profile, parent=None):
@@ -170,20 +240,20 @@ class WhatsAppWebPage(QWebEnginePage):
 
     def acceptNavigationRequest(self, url: QUrl, nav_type, is_main_frame):
         host = url.host().lower()
+        url_str = url.toString()
+
+        # Always permit internal WhatsApp traffic, websocket, blob, and initial load
         if (
             not host
             or "whatsapp.com" in host
             or "whatsapp.net" in host
-            or url.scheme() in ("blob", "data", "about")
+            or url.scheme() in ("blob", "data", "about", "wss", "ws")
         ):
             return True
 
-        # Open external links in default browser
-        if nav_type == QWebEnginePage.NavigationType.NavigationTypeLinkClicked:
-            QDesktopServices.openUrl(url)
-            return False
-
-        return True
+        # Any external URL: open directly in system default browser!
+        open_external_url(url_str)
+        return False
 
     def createWindow(self, window_type):
         return ExternalLinkPage(self.profile(), self)
@@ -240,6 +310,37 @@ class WhatsAppWindow(QMainWindow):
 
         # Connect download handler
         self.profile.downloadRequested.connect(self.on_download_requested)
+
+        # Inject click interceptor for external links
+        link_script = QWebEngineScript()
+        link_script.setName("external_link_interceptor")
+        link_script.setSourceCode("""
+        (function() {
+            document.addEventListener('click', function(e) {
+                let el = e.target;
+                while (el && el.tagName !== 'A') {
+                    el = el.parentElement;
+                }
+                if (el && el.tagName === 'A' && el.href) {
+                    const href = el.href;
+                    if (href.startsWith('http://') || href.startsWith('https://')) {
+                        try {
+                            const url = new URL(href);
+                            if (!url.hostname.includes('whatsapp.com') && !url.hostname.includes('whatsapp.net')) {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                window.open(href, '_blank');
+                            }
+                        } catch (err) {}
+                    }
+                }
+            }, true);
+        })();
+        """)
+        link_script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentReady)
+        link_script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        link_script.setRunsOnSubFrames(True)
+        self.profile.scripts().insert(link_script)
 
         # Desktop notification presenter
         if hasattr(self.profile, 'setNotificationPresenter'):
