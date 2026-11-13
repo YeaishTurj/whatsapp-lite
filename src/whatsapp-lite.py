@@ -24,6 +24,7 @@ import re
 import shutil
 import subprocess
 import urllib.parse
+import time
 
 # ---------------------------------------------------------
 # Chromium & Qt Optimization Flags
@@ -137,6 +138,9 @@ def get_base_icon() -> QIcon:
 # ---------------------------------------------------------
 # External URL Dispatcher (Wayland & Linux Native)
 # ---------------------------------------------------------
+_last_opened_url = None
+_last_opened_time = 0.0
+
 def clean_external_url(url_str: str) -> str:
     """Unwrap Meta / WhatsApp redirect tracker parameters if present"""
     if not url_str:
@@ -152,7 +156,9 @@ def clean_external_url(url_str: str) -> str:
     return url_str
 
 def open_external_url(target):
-    """Reliably launch external URL in user's default browser (e.g. Chrome / Brave)"""
+    """Reliably launch external URL in user's default browser (e.g. Chrome / Brave) with de-duplication"""
+    global _last_opened_url, _last_opened_time
+
     if isinstance(target, QUrl):
         url_str = target.toString()
     else:
@@ -161,6 +167,13 @@ def open_external_url(target):
     url_str = clean_external_url(url_str).strip()
     if not url_str or url_str in ("about:blank", "about:", ""):
         return
+
+    # Debounce identical URL within 1.5 seconds to prevent duplicate tabs
+    now = time.time()
+    if url_str == _last_opened_url and (now - _last_opened_time) < 1.5:
+        return
+    _last_opened_url = url_str
+    _last_opened_time = now
 
     # 1. Primary: xdg-open in detached session
     try:
@@ -197,21 +210,27 @@ class ExternalLinkPage(QWebEnginePage):
     """Temporary page to intercept window.open and target='_blank' links"""
     def __init__(self, profile, parent=None):
         super().__init__(profile, parent)
+        self.has_dispatched = False
         self.urlChanged.connect(self.on_url_changed)
+
+    def _dispatch_once(self, url: QUrl):
+        if self.has_dispatched:
+            return
+        url_str = url.toString()
+        if url_str and url_str not in ("about:blank", "about:"):
+            self.has_dispatched = True
+            open_external_url(url_str)
+            self.deleteLater()
 
     def acceptNavigationRequest(self, url: QUrl, nav_type, is_main_frame):
         url_str = url.toString()
-        if url_str and url_str != "about:blank":
-            open_external_url(url_str)
-            self.deleteLater()
+        if url_str and url_str not in ("about:blank", "about:"):
+            self._dispatch_once(url)
             return False
         return True
 
     def on_url_changed(self, url: QUrl):
-        url_str = url.toString()
-        if url_str and url_str != "about:blank":
-            open_external_url(url_str)
-            self.deleteLater()
+        self._dispatch_once(url)
 
 class WhatsAppWebPage(QWebEnginePage):
     def __init__(self, profile, parent=None):
