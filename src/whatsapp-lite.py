@@ -276,6 +276,10 @@ class WhatsAppWebPage(QWebEnginePage):
                 pass
 
     def acceptNavigationRequest(self, url: QUrl, nav_type, is_main_frame):
+        # 1. Subframes (iframes for media, embeds, etc.) MUST always load internally
+        if not is_main_frame:
+            return True
+
         host = url.host().lower()
         url_str = url.toString()
 
